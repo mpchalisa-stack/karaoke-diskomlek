@@ -1,17 +1,10 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-
-const ICE_SERVERS: RTCConfiguration = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:stun3.l.google.com:19302' },
-    { urls: 'stun:stun4.l.google.com:19302' },
-    { urls: 'stun:stun.services.mozilla.com:3478' },
-    { urls: 'stun:stun.cloudflare.com:3478' },
-  ],
-  iceCandidatePoolSize: 10,
-};
+import {
+  RTC_ICE_SERVERS,
+  isSecureContextValid,
+  getFriendlyMicErrorMessage,
+  waitForWebSocketReady,
+} from '../services/signaling';
 
 /**
  * Optimizes WebRTC SDP for ultra-low latency audio (10ms packetization, mono, CBR, zero FEC lookahead).
@@ -54,6 +47,7 @@ export interface UseWebRTCMicrophoneOptions {
   roomId: string;
   singerName: string;
   onToast?: (msg: string) => void;
+  onRequestReconnect?: () => void;
 }
 
 export function useWebRTCMicrophone({
@@ -61,6 +55,7 @@ export function useWebRTCMicrophone({
   roomId,
   singerName,
   onToast,
+  onRequestReconnect,
 }: UseWebRTCMicrophoneOptions) {
   const senderName = singerName;
   const [isStreaming, setIsStreaming] = useState(false);
@@ -89,7 +84,7 @@ export function useWebRTCMicrophone({
   const isStreamingRef = useRef(false);
   const lastLevelSentRef = useRef<number>(0);
 
-  // Keep ref synchronized
+  // Keep refs synchronized
   useEffect(() => {
     isMutedRef.current = isMuted;
   }, [isMuted]);
@@ -245,23 +240,63 @@ export function useWebRTCMicrophone({
 
   // Start broadcasting microphone via WebRTC + real-time WebSocket audio relay
   const startBroadcasting = useCallback(
-    async (forceEchoCancel?: boolean) => {
+    async (forceEchoCancel?: boolean): Promise<boolean> => {
       setMicError(null);
       setConnectionStatus('connecting');
 
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        const err = 'Peramban tidak mendukung akses mikrofon WebRTC.';
-        setMicError(err);
+      // 1. Pre-flight Check: Ensure Room ID is present and valid
+      if (!roomId || !roomId.trim()) {
+        const errMsg = 'ID Ruangan belum terdaftar. Pastikan terhubung ke ruangan aktif sebelum menyalakan mikrofon.';
+        setMicError(errMsg);
         setConnectionStatus('error');
-        if (onToast) onToast(err);
+        if (onToast) onToast(errMsg);
+        return false;
+      }
+
+      // 2. Pre-flight Check: Ensure WebSocket signaling is connected to the active room BEFORE getUserMedia
+      let isSocketReady = socketRef.current?.readyState === WebSocket.OPEN;
+
+      if (!isSocketReady) {
+        if (onToast) onToast('Menyambungkan sinyal ruangan Karaoke...');
+
+        // If closed, closing, or null, request reconnect
+        if (
+          !socketRef.current ||
+          socketRef.current.readyState === WebSocket.CLOSED ||
+          socketRef.current.readyState === WebSocket.CLOSING
+        ) {
+          if (onRequestReconnect) {
+            onRequestReconnect();
+          }
+        }
+
+        // Wait up to 5000ms for WebSocket to reach OPEN
+        isSocketReady = await waitForWebSocketReady(socketRef.current, 5000);
+
+        if (!isSocketReady || socketRef.current?.readyState !== WebSocket.OPEN) {
+          const errMsg = 'Koneksi WebSocket belum siap. Pastikan terhubung ke ruangan karaoke aktif sebelum menyalakan mikrofon.';
+          setMicError(errMsg);
+          setConnectionStatus('error');
+          if (onToast) onToast(errMsg);
+          return false;
+        }
+      }
+
+      // 3. Pre-flight Check: Ensure Secure Context (HTTPS or localhost)
+      const secureCheck = isSecureContextValid();
+      if (!secureCheck.valid) {
+        const errText = secureCheck.reason || 'Akses Mikrofon Bermasalah: Diperlukan koneksi HTTPS.';
+        setMicError(errText);
+        setConnectionStatus('error');
+        if (onToast) onToast(errText);
         return false;
       }
 
       const useEcho = typeof forceEchoCancel === 'boolean' ? forceEchoCancel : isEchoCancellationEnabled;
 
+      // 4. Initialize Audio MediaStream ONLY after WebSocket is verified OPEN to the active room
+      let stream: MediaStream;
       try {
-        // 1. Capture microphone with clean audio parameters
-        let stream: MediaStream;
         try {
           stream = await navigator.mediaDevices.getUserMedia({
             audio: {
@@ -273,20 +308,35 @@ export function useWebRTCMicrophone({
             },
             video: false,
           });
-        } catch {
-          // Fallback constraint for older Android engines
+        } catch (constraintErr: any) {
+          // If error was NotAllowedError, do NOT retry constraints, throw immediately
+          if (
+            constraintErr.name === 'NotAllowedError' ||
+            constraintErr.name === 'PermissionDeniedError' ||
+            constraintErr.name === 'NotFoundError'
+          ) {
+            throw constraintErr;
+          }
+          console.warn('[WebRTC] Low-latency constraints failed, retrying generic audio:', constraintErr);
+          // Fallback to basic audio constraint for older Android browsers / WebViews
           stream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              echoCancellation: useEcho,
-              channelCount: 1,
-            },
+            audio: true,
             video: false,
           });
         }
+      } catch (err: any) {
+        console.error('[WebRTC] getUserMedia failed:', err);
+        const friendlyMessage = getFriendlyMicErrorMessage(err);
+        setMicError(friendlyMessage);
+        setConnectionStatus('error');
+        if (onToast) onToast(friendlyMessage);
+        return false;
+      }
 
-        localStreamRef.current = stream;
+      localStreamRef.current = stream;
 
-        // 2. Setup AudioContext and Audio Processor for live VU meter AND real-time WebSocket audio relay
+      try {
+        // 4. Setup AudioContext and Audio Processor for live VU meter AND real-time WebSocket audio relay
         const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
         if (AudioCtx) {
           const audioCtx = new AudioCtx({ latencyHint: 'interactive' });
@@ -318,7 +368,11 @@ export function useWebRTCMicrophone({
 
               // Throttle level update to Master (~60ms)
               const now = Date.now();
-              if (now - lastLevelSentRef.current > 60 && socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+              if (
+                now - lastLevelSentRef.current > 60 &&
+                socketRef.current &&
+                socketRef.current.readyState === WebSocket.OPEN
+              ) {
                 lastLevelSentRef.current = now;
                 try {
                   socketRef.current.send(
@@ -338,12 +392,12 @@ export function useWebRTCMicrophone({
             }
           };
 
-          // ScriptProcessor for real-time WebSocket audio relay (bufferSize = 2048 samples = ~42ms at 48kHz)
+          // ScriptProcessor for real-time WebSocket audio relay
           // Guarantees audio arrives at Master even across cellular CGNAT or symmetric firewalls
           const processor = audioCtx.createScriptProcessor(2048, 1, 1);
           scriptProcessorRef.current = processor;
           source.connect(processor);
-          // Connect to destination via silent dummy gain so Chrome runs the processor without sound feedback on phone
+
           const silentGain = audioCtx.createGain();
           silentGain.gain.value = 0.00001;
           processor.connect(silentGain);
@@ -354,7 +408,6 @@ export function useWebRTCMicrophone({
             const input = e.inputBuffer.getChannelData(0);
             if (!input || input.length === 0) return;
 
-            // Compute peak amplitude
             let maxVal = 0;
             const len = input.length;
             const pcm16 = new Int16Array(len);
@@ -362,14 +415,12 @@ export function useWebRTCMicrophone({
               const val = input[i];
               const abs = Math.abs(val);
               if (abs > maxVal) maxVal = abs;
-              // Float32 to 16-bit PCM conversion
               const clamped = Math.max(-1, Math.min(1, val));
               pcm16[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
             }
 
             const currentLevel = Math.min(100, Math.round(maxVal * 100));
 
-            // Convert to Base64 string
             const u8 = new Uint8Array(pcm16.buffer);
             let binary = '';
             const u8len = u8.byteLength;
@@ -401,8 +452,8 @@ export function useWebRTCMicrophone({
           updateMeter();
         }
 
-        // 3. Create WebRTC Peer Connection (P2P direct audio mode)
-        const pc = new RTCPeerConnection(ICE_SERVERS);
+        // 5. Create WebRTC Peer Connection (P2P direct audio mode)
+        const pc = new RTCPeerConnection(RTC_ICE_SERVERS);
         pcRef.current = pc;
 
         // Add audio track to peer connection with high priority
@@ -442,12 +493,12 @@ export function useWebRTCMicrophone({
           if (state === 'connected') {
             setConnectionStatus('connected');
           } else if (state === 'failed' || state === 'disconnected') {
-            // Note: WebSocket audio relay continues streaming even if WebRTC P2P drops!
+            // Note: WebSocket audio relay continues streaming seamlessly
             setConnectionStatus('connected');
           }
         };
 
-        // 4. Create Offer with low-latency audio settings
+        // 6. Create Offer with low-latency audio settings
         const rawOffer = await pc.createOffer({
           offerToReceiveAudio: false,
           offerToReceiveVideo: false,
@@ -460,7 +511,7 @@ export function useWebRTCMicrophone({
 
         await pc.setLocalDescription(optimizedOffer);
 
-        // 5. Send Offer and initial mic parameters to Master
+        // 7. Send Offer and initial mic parameters to Master
         if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
           socketRef.current.send(
             JSON.stringify({
@@ -487,30 +538,21 @@ export function useWebRTCMicrophone({
           );
 
           broadcastMicParams(micVolume, micEcho);
-        } else {
-          throw new Error('Koneksi WebSocket belum siap. Pastikan terhubung ke ruangan.');
         }
 
         isStreamingRef.current = true;
         setIsStreaming(true);
         setIsMuted(false);
         setConnectionStatus('connected');
-        if (onToast) onToast('🎤 Mikrofon HP Aktif! Suara langsung masuk ke Master.');
+        if (onToast) onToast('🎤 Mikrofon HP Aktif! Suara langsung terhubung ke Master.');
         return true;
       } catch (err: any) {
-        console.error('[WebRTC] Error starting mic broadcast:', err);
-        let message = 'Gagal mengakses mikrofon. Izinkan izin mikrofon di browser HP.';
-        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-          message = 'Izin mikrofon ditolak. Mohon izinkan mikrofon di pengaturan browser.';
-        } else if (err.name === 'NotFoundError') {
-          message = 'Tidak ada perangkat mikrofon yang terdeteksi.';
-        } else if (err.message) {
-          message = err.message;
-        }
-        setMicError(message);
+        console.error('[WebRTC] Error during peer setup:', err);
+        const errMsg = getFriendlyMicErrorMessage(err);
+        setMicError(errMsg);
         setConnectionStatus('error');
         stopBroadcasting();
-        if (onToast) onToast(message);
+        if (onToast) onToast(errMsg);
         return false;
       }
     },
@@ -525,6 +567,7 @@ export function useWebRTCMicrophone({
       micEcho,
       broadcastMicParams,
       onToast,
+      onRequestReconnect,
     ]
   );
 

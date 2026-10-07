@@ -1,18 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { optimizeSdpForUltraLowLatency } from './useWebRTCMicrophone';
-
-const ICE_SERVERS: RTCConfiguration = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:stun3.l.google.com:19302' },
-    { urls: 'stun:stun4.l.google.com:19302' },
-    { urls: 'stun:stun.services.mozilla.com:3478' },
-    { urls: 'stun:stun.cloudflare.com:3478' },
-  ],
-  iceCandidatePoolSize: 10,
-};
+import { RTC_ICE_SERVERS } from '../services/signaling';
 
 export interface ActiveWirelessMic {
   senderId: string;
@@ -584,7 +572,7 @@ export function useWebRTCAudioReceiver({ socketRef, roomId }: UseWebRTCAudioRece
             } catch {}
           }
 
-          const pc = new RTCPeerConnection(ICE_SERVERS);
+          const pc = new RTCPeerConnection(RTC_ICE_SERVERS);
           peerConnectionsRef.current.set(senderId, pc);
 
           // Handle incoming audio track with ultra-low latency playout hints

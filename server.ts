@@ -909,6 +909,13 @@ async function startServer() {
         if (!msg || !msg.type) return;
 
         switch (msg.type) {
+          case 'PING': {
+            try {
+              ws.send(JSON.stringify({ type: 'PONG', roomId: room.roomId, timestamp: Date.now() }));
+            } catch {}
+            break;
+          }
+
           case 'SYNC_STATE': {
             if (msg.payload) {
               if (msg.payload.currentSong !== undefined) room.currentSong = msg.payload.currentSong;

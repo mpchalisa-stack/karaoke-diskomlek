@@ -31,6 +31,7 @@ import { Song, QueueItem, SuffixFilter } from '../types/karaoke';
 import { CURATED_LIBRARY, extractYoutubeVideoId, fetchOEmbedInfo } from '../services/youtube';
 import { PWAInstallButton } from './PWAInstallButton';
 import { useWebRTCMicrophone } from '../hooks/useWebRTCMicrophone';
+import { getSignalingWebSocketUrl, getWebSocketStateName } from '../services/signaling';
 
 export interface MobileClientViewProps {
   isEmbedded?: boolean;
@@ -108,6 +109,16 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
     }, 2800);
   }, []);
 
+  // WebSocket signaling readyState tracking
+  const [wsReadyState, setWsReadyState] = useState<number>(WebSocket.CONNECTING);
+  const triggerReconnectRef = useRef<(() => void) | null>(null);
+
+  const handleRequestReconnect = useCallback(() => {
+    if (triggerReconnectRef.current) {
+      triggerReconnectRef.current();
+    }
+  }, []);
+
   // WebRTC P2P Wireless Microphone Broadcaster Hook
   const {
     isStreaming: isMicStreaming,
@@ -136,6 +147,7 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
     roomId,
     singerName,
     onToast: showToast,
+    onRequestReconnect: handleRequestReconnect,
   });
 
   // Save singer name
@@ -181,19 +193,41 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
     let sseSource: EventSource | null = null;
     let reconnectTimeout: any = null;
 
+    let retryAttempt = 0;
+    let pingInterval: any = null;
+
     const connectWebSocket = () => {
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+      }
+
       try {
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws?room=${encodeURIComponent(
-          roomId
-        )}&role=client&singer=${encodeURIComponent(singerName)}`;
+        const wsUrl = getSignalingWebSocketUrl({
+          roomId,
+          role: 'client',
+          singerName,
+        });
 
         socket = new WebSocket(wsUrl);
         wsRef.current = socket;
+        setWsReadyState(WebSocket.CONNECTING);
 
         socket.onopen = () => {
+          retryAttempt = 0;
           lastSyncTime.current = Date.now();
           setIsConnected(true);
+          setWsReadyState(WebSocket.OPEN);
+
+          // Heartbeat ping every 20 seconds
+          if (pingInterval) clearInterval(pingInterval);
+          pingInterval = setInterval(() => {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+              try {
+                socket.send(JSON.stringify({ type: 'PING', roomId, timestamp: Date.now() }));
+              } catch {}
+            }
+          }, 20000);
         };
 
         socket.onmessage = (event) => {
@@ -278,18 +312,35 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
         };
 
         socket.onclose = () => {
+          setWsReadyState(WebSocket.CLOSED);
+          if (pingInterval) {
+            clearInterval(pingInterval);
+            pingInterval = null;
+          }
           // Do not force isConnected to false if HTTP ping is still succeeding!
           if (Date.now() - lastSyncTime.current > 7000) {
             setIsConnected(false);
           }
-          reconnectTimeout = setTimeout(connectWebSocket, 4000);
+          retryAttempt++;
+          const delay = Math.min(1500 * Math.pow(1.3, retryAttempt), 10000);
+          reconnectTimeout = setTimeout(connectWebSocket, delay);
         };
 
         socket.onerror = () => {
-          // Cloud proxies may drop WSS handshakes; HTTP ping seamlessly takes over
+          setWsReadyState(WebSocket.CLOSED);
+          try {
+            socket?.close();
+          } catch {}
         };
       } catch (err) {
+        setWsReadyState(WebSocket.CLOSED);
         connectSSE();
+      }
+    };
+
+    triggerReconnectRef.current = () => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        connectWebSocket();
       }
     };
 
@@ -340,7 +391,9 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
     const pollInterval = setInterval(fetchRoomState, 1500);
 
     return () => {
+      triggerReconnectRef.current = null;
       clearInterval(pollInterval);
+      if (pingInterval) clearInterval(pingInterval);
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
       if (socket) socket.close();
       if (sseSource) sseSource.close();
@@ -1060,54 +1113,116 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
                 </div>
               </div>
 
-              {/* Status Badge */}
-              <div className="mt-3 pt-3 border-t border-emerald-700/40 flex items-center justify-between text-xs">
-                <span className="text-slate-300">Status Koneksi:</span>
-                <span className="font-mono font-bold flex items-center gap-1.5">
-                  <span
-                    className={`h-2 w-2 rounded-full ${
-                      isMicStreaming
-                        ? 'bg-emerald-400 animate-ping'
+              {/* Status Badges */}
+              <div className="mt-3 pt-3 border-t border-emerald-700/40 space-y-2 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-300">Koneksi Ruangan:</span>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono font-bold flex items-center gap-1.5">
+                      <span
+                        className={`h-2 w-2 rounded-full ${
+                          wsReadyState === WebSocket.OPEN
+                            ? 'bg-emerald-400'
+                            : wsReadyState === WebSocket.CONNECTING
+                            ? 'bg-amber-400 animate-pulse'
+                            : 'bg-rose-500'
+                        }`}
+                      />
+                      <span
+                        className={
+                          wsReadyState === WebSocket.OPEN
+                            ? 'text-emerald-300'
+                            : wsReadyState === WebSocket.CONNECTING
+                            ? 'text-amber-300'
+                            : 'text-rose-300'
+                        }
+                      >
+                        {wsReadyState === WebSocket.OPEN
+                          ? `Terhubung (${roomId})`
+                          : wsReadyState === WebSocket.CONNECTING
+                          ? 'Menyambungkan...'
+                          : 'Terputus'}
+                      </span>
+                    </span>
+                    {wsReadyState !== WebSocket.OPEN && (
+                      <button
+                        onClick={handleRequestReconnect}
+                        className="px-2 py-0.5 rounded bg-sky-600/80 hover:bg-sky-500 text-white text-[10px] font-bold transition active:scale-95 flex items-center gap-1"
+                      >
+                        <RefreshCw className="h-2.5 w-2.5" />
+                        Sambung Ulang
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-300">Jalur Audio HP:</span>
+                  <span className="font-mono font-bold flex items-center gap-1.5">
+                    <span
+                      className={`h-2 w-2 rounded-full ${
+                        isMicStreaming
+                          ? 'bg-emerald-400 animate-ping'
+                          : micConnectionStatus === 'connecting'
+                          ? 'bg-amber-400 animate-pulse'
+                          : micConnectionStatus === 'error'
+                          ? 'bg-rose-400'
+                          : 'bg-slate-400'
+                      }`}
+                    />
+                    <span
+                      className={
+                        isMicStreaming
+                          ? 'text-emerald-300'
+                          : micConnectionStatus === 'connecting'
+                          ? 'text-amber-300'
+                          : micConnectionStatus === 'error'
+                          ? 'text-rose-300'
+                          : 'text-slate-400'
+                      }
+                    >
+                      {isMicStreaming
+                        ? 'Mengudara ke TV (WebRTC)'
                         : micConnectionStatus === 'connecting'
-                        ? 'bg-amber-400 animate-pulse'
+                        ? 'Menghubungkan WebRTC...'
                         : micConnectionStatus === 'error'
-                        ? 'bg-rose-400'
-                        : 'bg-slate-400'
-                    }`}
-                  />
-                  <span
-                    className={
-                      isMicStreaming
-                        ? 'text-emerald-300'
-                        : micConnectionStatus === 'connecting'
-                        ? 'text-amber-300'
-                        : micConnectionStatus === 'error'
-                        ? 'text-rose-300'
-                        : 'text-slate-400'
-                    }
-                  >
-                    {isMicStreaming
-                      ? 'Mengudara ke Speaker TV (P2P)'
-                      : micConnectionStatus === 'connecting'
-                      ? 'Menghubungkan WebRTC...'
-                      : micConnectionStatus === 'error'
-                      ? 'Gagal / Perlu Izin Mic'
-                      : 'Siap Digunakan'}
+                        ? 'Perlu Izin / Tindakan'
+                        : 'Siap Digunakan'}
+                    </span>
                   </span>
-                </span>
+                </div>
               </div>
             </div>
 
             {/* Error banner if any */}
             {micError && (
-              <div className="rounded-xl border border-rose-500/60 bg-rose-950/80 p-3 text-xs text-rose-200 shadow flex items-start gap-2.5">
-                <MicOff className="h-4 w-4 text-rose-400 shrink-0 mt-0.5" />
-                <div>
-                  <p className="font-bold text-rose-300">Akses Mikrofon Bermasalah</p>
-                  <p className="mt-0.5 text-[11px]">{micError}</p>
-                  <p className="mt-1 text-[10px] text-rose-400">
-                    💡 Tips: Berikan izin akses mikrofon di pengaturan browser HP lalu muat ulang.
+              <div className="rounded-xl border border-rose-500/60 bg-rose-950/85 p-3.5 text-xs text-rose-200 shadow-lg flex items-start gap-3">
+                <MicOff className="h-5 w-5 text-rose-400 shrink-0 mt-0.5" />
+                <div className="flex-1 space-y-1">
+                  <p className="font-bold text-rose-300 text-sm">
+                    {micError.includes('WebSocket')
+                      ? 'Koneksi Ruangan Belum Siap'
+                      : micError.includes('Izin') || micError.includes('ditolak')
+                      ? 'Izin Mikrofon Ditolak'
+                      : micError.includes('HTTPS')
+                      ? 'Koneksi Wajib HTTPS'
+                      : 'Akses Mikrofon Bermasalah'}
                   </p>
+                  <p className="text-[11px] leading-relaxed text-rose-100">{micError}</p>
+                  {micError.includes('WebSocket') && (
+                    <button
+                      onClick={handleRequestReconnect}
+                      className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs shadow transition active:scale-95"
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      Sambungkan Ulang Ruangan Sekarang
+                    </button>
+                  )}
+                  {micError.includes('Izin') && (
+                    <p className="mt-1 text-[10px] text-amber-300">
+                      💡 Tips: Buka setelan browser HP (ikon gembok di samping tautan URL) &gt; Setelan Situs &gt; Izinkan Mikrofon, lalu muat ulang halaman.
+                    </p>
+                  )}
                 </div>
               </div>
             )}
@@ -1117,7 +1232,13 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
               {!isMicStreaming ? (
                 <div className="space-y-4">
                   <button
-                    onClick={() => startMicBroadcast()}
+                    onClick={async () => {
+                      if (wsReadyState !== WebSocket.OPEN) {
+                        showToast('Menyambungkan sinyal ruangan Karaoke...');
+                        handleRequestReconnect();
+                      }
+                      await startMicBroadcast();
+                    }}
                     disabled={micConnectionStatus === 'connecting'}
                     className="w-full py-4 px-6 rounded-2xl bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-600 hover:from-emerald-500 hover:to-teal-500 text-white font-display text-sm font-black tracking-wide shadow-xl shadow-emerald-950/70 border-2 border-emerald-400 active:scale-98 transition flex items-center justify-center gap-3 disabled:opacity-50"
                   >

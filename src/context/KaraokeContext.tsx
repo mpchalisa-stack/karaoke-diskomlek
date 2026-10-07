@@ -5,6 +5,7 @@ import { searchKaraokeSongs, CURATED_LIBRARY, CATEGORY_PRESETS, extractYoutubeVi
 import { audioFx } from '../services/audioFx';
 import { useWebRTCAudioReceiver, ActiveWirelessMic } from '../hooks/useWebRTCAudioReceiver';
 import { useKaraokeScoring, LiveScoringState } from '../hooks/useKaraokeScoring';
+import { getSignalingWebSocketUrl } from '../services/signaling';
 
 interface KaraokeContextType {
   // Search & Filter
@@ -357,6 +358,8 @@ export const KaraokeProvider: React.FC<{ children: React.ReactNode; initialIsTvM
     let socket: WebSocket | null = null;
     let sseSource: EventSource | null = null;
     let reconnectTimer: any = null;
+    let pingInterval: any = null;
+    let retryCount = 0;
 
     const fetchRoomState = async () => {
       try {
@@ -399,14 +402,31 @@ export const KaraokeProvider: React.FC<{ children: React.ReactNode; initialIsTvM
     syncStateToServer();
 
     const connectWs = () => {
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
       try {
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws?room=${encodeURIComponent(
-          roomId
-        )}&role=master&singer=Layar%20Utama`;
+        const wsUrl = getSignalingWebSocketUrl({
+          roomId,
+          role: 'master',
+          singerName: 'Layar Utama',
+        });
 
         socket = new WebSocket(wsUrl);
         wsRef.current = socket;
+
+        socket.onopen = () => {
+          retryCount = 0;
+          if (pingInterval) clearInterval(pingInterval);
+          pingInterval = setInterval(() => {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+              try {
+                socket.send(JSON.stringify({ type: 'PING', roomId, timestamp: Date.now() }));
+              } catch {}
+            }
+          }, 20000);
+        };
 
         socket.onmessage = (event) => {
           try {
@@ -563,11 +583,19 @@ export const KaraokeProvider: React.FC<{ children: React.ReactNode; initialIsTvM
         };
 
         socket.onclose = () => {
-          reconnectTimer = setTimeout(connectWs, 3000);
+          if (pingInterval) {
+            clearInterval(pingInterval);
+            pingInterval = null;
+          }
+          retryCount++;
+          const delay = Math.min(1500 * Math.pow(1.3, retryCount), 10000);
+          reconnectTimer = setTimeout(connectWs, delay);
         };
 
         socket.onerror = () => {
-          socket?.close();
+          try {
+            socket?.close();
+          } catch {}
         };
       } catch (e) {
         connectSSE();
@@ -622,6 +650,7 @@ export const KaraokeProvider: React.FC<{ children: React.ReactNode; initialIsTvM
 
     return () => {
       clearInterval(pollTimer);
+      if (pingInterval) clearInterval(pingInterval);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (socket) socket.close();
       if (sseSource) sseSource.close();
