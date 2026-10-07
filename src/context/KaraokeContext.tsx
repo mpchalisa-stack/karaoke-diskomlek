@@ -6,6 +6,8 @@ import { audioFx } from '../services/audioFx';
 import { useWebRTCAudioReceiver, ActiveWirelessMic } from '../hooks/useWebRTCAudioReceiver';
 import { useKaraokeScoring, LiveScoringState } from '../hooks/useKaraokeScoring';
 import { getSignalingWebSocketUrl } from '../services/signaling';
+import { getTvPeerId, createPeer, type PeerMessage, type DataConnection } from '../services/peerManager';
+import type Peer from 'peerjs';
 
 interface KaraokeContextType {
   // Search & Filter
@@ -236,10 +238,16 @@ export const KaraokeProvider: React.FC<{ children: React.ReactNode; initialIsTvM
     setClientMicEcho,
     toggleClientMicMute,
     handleSignalingMessage: handleWebRTCSignaling,
+    attachAudioStream,
+    cleanupSender,
   } = useWebRTCAudioReceiver({
     socketRef: wsRef,
     roomId,
   });
+
+  // PeerJS P2P TV Master references (Serverless WebRTC via 0.peerjs.com)
+  const peerRef = useRef<Peer | null>(null);
+  const peerConnectionsRef = useRef<Map<string, DataConnection>>(new Map());
 
   // Reference to HTMLMediaElement for Web Audio API music analyzer
   const musicMediaRef = useRef<HTMLMediaElement | null>(null);
@@ -1118,6 +1126,225 @@ export const KaraokeProvider: React.FC<{ children: React.ReactNode; initialIsTvM
       setIsPlaying(false);
     }
   }, [currentSong, defaultSingerName, queue, stopScoringAndGetResult, generateScoreData]);
+
+  // Helper to broadcast messages to all connected PeerJS mobile clients
+  const broadcastToPeers = useCallback((msg: PeerMessage) => {
+    peerConnectionsRef.current.forEach((conn) => {
+      if (conn.open) {
+        try {
+          conn.send(msg);
+        } catch {}
+      }
+    });
+  }, []);
+
+  // Broadcast TV status update to all connected PeerJS mobile clients whenever song or queue changes
+  useEffect(() => {
+    const msg: PeerMessage = {
+      action: 'STATUS_UPDATE',
+      nowPlaying: currentSong?.title || '',
+      isPlaying,
+      currentTime: 0,
+      song: currentSong,
+      queue,
+      clientCount: Math.max(1, peerConnectionsRef.current.size + 1),
+      timestamp: Date.now(),
+    };
+    broadcastToPeers(msg);
+  }, [currentSong, isPlaying, queue, broadcastToPeers]);
+
+  // PeerJS P2P Master Host: Enables serverless direct TV-HP connections (Vercel ready via 0.peerjs.com)
+  useEffect(() => {
+    let peerInstance: Peer | null = null;
+    let isCleanedUp = false;
+
+    try {
+      const tvPeerId = getTvPeerId(roomId);
+      peerInstance = createPeer(tvPeerId);
+      peerRef.current = peerInstance;
+
+      peerInstance.on('open', (id) => {
+        if (isCleanedUp) return;
+        console.log('[PeerJS TV Master] Berhasil terdaftar dengan Peer ID:', id);
+      });
+
+      // Handle incoming data connections from mobile clients (Remote control & queue sync)
+      peerInstance.on('connection', (conn) => {
+        if (isCleanedUp) return;
+
+        conn.on('open', () => {
+          peerConnectionsRef.current.set(conn.peer, conn);
+          setRemoteConnectedDevices(Math.max(1, peerConnectionsRef.current.size + 1));
+
+          // Immediately send full state snapshot to the newly connected phone
+          conn.send({
+            action: 'STATUS_UPDATE',
+            nowPlaying: currentSong?.title || '',
+            isPlaying,
+            currentTime: 0,
+            song: currentSong,
+            queue,
+            clientCount: Math.max(1, peerConnectionsRef.current.size + 1),
+          });
+        });
+
+        conn.on('data', (data: any) => {
+          if (!data || !data.action) return;
+
+          switch (data.action) {
+            case 'PLAY':
+              setIsPlaying(true);
+              break;
+
+            case 'PAUSE':
+              setIsPlaying(false);
+              break;
+
+            case 'NEXT_SONG':
+              skipNextSong();
+              break;
+
+            case 'SELECT_SONG':
+              if (data.payload) {
+                playSongNow(data.payload, data.senderName);
+              }
+              break;
+
+            case 'SET_VOLUME':
+              if (typeof data.payload === 'number') {
+                setAudioVolume(data.payload);
+              }
+              break;
+
+            case 'ADD_QUEUE':
+              if (data.payload?.song) {
+                addToQueue(data.payload.song, data.payload.singerName, data.payload.priority);
+              }
+              break;
+
+            case 'REMOVE_QUEUE':
+              if (data.payload?.queueId) {
+                removeFromQueue(data.payload.queueId);
+              }
+              break;
+
+            case 'REORDER_QUEUE':
+              if (typeof data.payload?.fromIndex === 'number' && typeof data.payload?.toIndex === 'number') {
+                moveQueueItem(data.payload.fromIndex, data.payload.toIndex);
+              }
+              break;
+
+            case 'PLAY_SOUND_FX':
+              if (data.payload?.sound) {
+                triggerSoundFx(data.payload.sound, false, data.payload.senderName);
+              }
+              break;
+
+            case 'MIC_PARAMS':
+              if (data.payload) {
+                const targetId = conn.peer;
+                if (typeof data.payload.volume === 'number') {
+                  setClientMicVolume(targetId, data.payload.volume);
+                }
+                if (typeof data.payload.echo === 'number') {
+                  setClientMicEcho(targetId, data.payload.echo);
+                }
+              }
+              break;
+
+            case 'STATUS_UPDATE':
+              conn.send({
+                action: 'STATUS_UPDATE',
+                nowPlaying: currentSong?.title || '',
+                isPlaying,
+                currentTime: 0,
+                song: currentSong,
+                queue,
+                clientCount: Math.max(1, peerConnectionsRef.current.size + 1),
+              });
+              break;
+          }
+        });
+
+        conn.on('close', () => {
+          peerConnectionsRef.current.delete(conn.peer);
+          setRemoteConnectedDevices(Math.max(1, peerConnectionsRef.current.size + 1));
+        });
+
+        conn.on('error', () => {
+          peerConnectionsRef.current.delete(conn.peer);
+          setRemoteConnectedDevices(Math.max(1, peerConnectionsRef.current.size + 1));
+        });
+      });
+
+      // Handle incoming WebRTC MediaConnection for Wireless Microphone audio streaming
+      peerInstance.on('call', (mediaConn) => {
+        if (isCleanedUp) return;
+
+        // Answer call to accept incoming audio stream from phone
+        mediaConn.answer();
+        const senderId = mediaConn.peer;
+        const senderName = mediaConn.metadata?.singerName || 'Prajurit (HP)';
+
+        mediaConn.on('stream', (remoteStream) => {
+          attachAudioStream(senderId, senderName, remoteStream);
+          addRemoteNotification(
+            `🎤 ${senderName} mengaktifkan Mikrofon HP (P2P)! Suara langsung disiarkan ke speaker TV.`,
+            senderName,
+            'success'
+          );
+        });
+
+        mediaConn.on('close', () => {
+          cleanupSender(senderId);
+          addRemoteNotification(
+            `🎤 ${senderName} mematikan Mikrofon HP.`,
+            senderName,
+            'info'
+          );
+        });
+
+        mediaConn.on('error', () => {
+          cleanupSender(senderId);
+        });
+      });
+
+      peerInstance.on('error', (err: any) => {
+        console.warn('[PeerJS TV Master] error:', err?.type || err?.message || err);
+      });
+    } catch (e) {
+      console.warn('[PeerJS TV Master] initialization error:', e);
+    }
+
+    return () => {
+      isCleanedUp = true;
+      peerConnectionsRef.current.clear();
+      if (peerInstance) {
+        try {
+          peerInstance.destroy();
+        } catch {}
+      }
+      peerRef.current = null;
+    };
+  }, [
+    roomId,
+    currentSong,
+    isPlaying,
+    queue,
+    attachAudioStream,
+    cleanupSender,
+    addRemoteNotification,
+    addToQueue,
+    moveQueueItem,
+    playSongNow,
+    removeFromQueue,
+    setAudioVolume,
+    setClientMicEcho,
+    setClientMicVolume,
+    setIsPlaying,
+    skipNextSong,
+    triggerSoundFx,
+  ]);
 
   return (
     <KaraokeContext.Provider

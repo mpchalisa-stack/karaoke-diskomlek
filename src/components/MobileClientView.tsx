@@ -32,6 +32,8 @@ import { CURATED_LIBRARY, extractYoutubeVideoId, fetchOEmbedInfo } from '../serv
 import { PWAInstallButton } from './PWAInstallButton';
 import { useWebRTCMicrophone } from '../hooks/useWebRTCMicrophone';
 import { getSignalingWebSocketUrl, getWebSocketStateName } from '../services/signaling';
+import { getTvPeerId, getClientPeerId, createPeer, type PeerAction, type PeerMessage, type DataConnection, type MediaConnection } from '../services/peerManager';
+import type Peer from 'peerjs';
 
 export interface MobileClientViewProps {
   isEmbedded?: boolean;
@@ -109,6 +111,36 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
     }, 2800);
   }, []);
 
+  // PeerJS P2P Client (Enables serverless direct TV-HP connections without backend WebSocket)
+  const [peerConnectionState, setPeerConnectionState] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
+  const peerRef = useRef<Peer | null>(null);
+  const dataConnRef = useRef<DataConnection | null>(null);
+  const mediaConnRef = useRef<MediaConnection | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const reconnectPeerTimerRef = useRef<any>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animFrameRef = useRef<number | null>(null);
+
+  const [peerMicStreaming, setPeerMicStreaming] = useState<boolean>(false);
+  const [peerMicMuted, setPeerMicMuted] = useState<boolean>(false);
+  const [peerMicError, setPeerMicError] = useState<string | null>(null);
+  const [peerAudioLevel, setPeerAudioLevel] = useState<number>(0);
+  const [peerMicStatus, setPeerMicStatus] = useState<'idle' | 'connecting' | 'connected' | 'error'>('idle');
+
+  // Helper to send JSON messages to TV Master via PeerJS DataConnection
+  const sendPeerMessage = useCallback((msg: PeerMessage): boolean => {
+    if (dataConnRef.current && dataConnRef.current.open) {
+      try {
+        dataConnRef.current.send(msg);
+        return true;
+      } catch (err) {
+        console.warn('[PeerJS] send error:', err);
+      }
+    }
+    return false;
+  }, []);
+
   // WebSocket signaling readyState tracking
   const [wsReadyState, setWsReadyState] = useState<number>(WebSocket.CONNECTING);
   const triggerReconnectRef = useRef<(() => void) | null>(null);
@@ -184,6 +216,267 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
       }
     }
   }, [roomId, singerName, clientId]);
+
+  // PeerJS Client connection & auto-reconnect logic (Serverless direct TV-HP connections)
+  const establishDataConnection = useCallback((peer: Peer, targetTvId: string) => {
+    setPeerConnectionState('connecting');
+    const conn = peer.connect(targetTvId, { reliable: true });
+    dataConnRef.current = conn;
+
+    conn.on('open', () => {
+      console.log('[PeerJS HP] Connected to TV Master:', targetTvId);
+      setPeerConnectionState('connected');
+      setIsConnected(true);
+      // Handshake to TV
+      conn.send({ action: 'STATUS_UPDATE', senderName: singerName, senderId: peer.id });
+      showToast('🟢 Terhubung ke TV Master (P2P)!');
+    });
+
+    conn.on('data', (data: any) => {
+      if (data && data.action === 'STATUS_UPDATE') {
+        if (data.song !== undefined) setCurrentSong(data.song);
+        if (typeof data.isPlaying === 'boolean') setIsPlaying(data.isPlaying);
+        if (Array.isArray(data.queue)) setQueue(data.queue);
+        if (typeof data.clientCount === 'number') setClientCount(data.clientCount);
+        setIsConnected(true);
+        setPeerConnectionState('connected');
+      }
+    });
+
+    conn.on('close', () => {
+      console.log('[PeerJS HP] Connection to TV closed');
+      setPeerConnectionState('disconnected');
+      schedulePeerReconnect();
+    });
+
+    conn.on('error', (err) => {
+      console.warn('[PeerJS HP] Connection error:', err);
+      setPeerConnectionState('disconnected');
+      schedulePeerReconnect();
+    });
+  }, [singerName, showToast]);
+
+  const schedulePeerReconnect = useCallback(() => {
+    if (reconnectPeerTimerRef.current) clearTimeout(reconnectPeerTimerRef.current);
+    reconnectPeerTimerRef.current = setTimeout(() => {
+      connectToTvPeer();
+    }, 3000);
+  }, []);
+
+  // Send action to TV via PeerJS DataConnection
+  const sendPeerAction = useCallback((action: PeerAction, payload?: any): boolean => {
+    if (dataConnRef.current && dataConnRef.current.open) {
+      try {
+        dataConnRef.current.send({
+          action,
+          payload,
+          senderName: singerName,
+          senderId: peerRef.current?.id,
+          timestamp: Date.now(),
+        });
+        return true;
+      } catch (err) {
+        console.warn('[PeerJS HP] Error sending action:', err);
+      }
+    }
+    return false;
+  }, [singerName]);
+
+  const connectToTvPeer = useCallback(() => {
+    if (reconnectPeerTimerRef.current) {
+      clearTimeout(reconnectPeerTimerRef.current);
+      reconnectPeerTimerRef.current = null;
+    }
+
+    try {
+      const tvPeerId = getTvPeerId(roomId);
+
+      if (!peerRef.current || peerRef.current.destroyed) {
+        const clientPeer = createPeer(getClientPeerId(roomId));
+        peerRef.current = clientPeer;
+
+        clientPeer.on('open', (id) => {
+          console.log('[PeerJS HP] Client peer registered:', id);
+          establishDataConnection(clientPeer, tvPeerId);
+        });
+
+        clientPeer.on('error', (err: any) => {
+          console.warn('[PeerJS HP] Client peer error:', err?.type || err?.message || err);
+          setPeerConnectionState('disconnected');
+          schedulePeerReconnect();
+        });
+      } else if (peerRef.current.open) {
+        establishDataConnection(peerRef.current, tvPeerId);
+      }
+    } catch (err) {
+      console.warn('[PeerJS HP] Initialization error:', err);
+      setPeerConnectionState('disconnected');
+      schedulePeerReconnect();
+    }
+  }, [roomId, establishDataConnection, schedulePeerReconnect]);
+
+  useEffect(() => {
+    connectToTvPeer();
+
+    return () => {
+      if (reconnectPeerTimerRef.current) clearTimeout(reconnectPeerTimerRef.current);
+      if (dataConnRef.current) {
+        try {
+          dataConnRef.current.close();
+        } catch {}
+      }
+      if (peerRef.current) {
+        try {
+          peerRef.current.destroy();
+        } catch {}
+      }
+    };
+  }, [connectToTvPeer]);
+
+  // PeerJS WebRTC Microphone Streamer (Streams HP audio directly to TV)
+  const startPeerMic = useCallback(async () => {
+    setPeerMicError(null);
+    setPeerMicStatus('connecting');
+
+    if (peerConnectionState !== 'connected' || !dataConnRef.current?.open) {
+      const err = 'Koneksi ke TV belum siap. Pastikan terhubung ke TV sebelum menyalakan mikrofon.';
+      setPeerMicError(err);
+      setPeerMicStatus('error');
+      showToast(err);
+      return false;
+    }
+
+    let stream: MediaStream;
+    try {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            channelCount: 1,
+            sampleRate: 48000,
+          },
+          video: false,
+        });
+      } catch (conErr) {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: false,
+        });
+      }
+    } catch (err: any) {
+      console.error('[Mic] getUserMedia error:', err);
+      const name = err?.name || '';
+      let msg = 'Gagal mengakses mikrofon.';
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        msg = 'Izin mikrofon ditolak oleh browser HP. Silakan buka Pengaturan Izin Situs dan pilih "Izinkan Mikrofon", lalu coba lagi.';
+      } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+        msg = 'Perangkat mikrofon tidak ditemukan di ponsel Anda.';
+      } else if (name === 'NotReadableError' || name === 'TrackStartError') {
+        msg = 'Mikrofon HP sedang digunakan oleh aplikasi lain (misal WhatsApp atau panggilan telepon).';
+      } else {
+        msg = err?.message || 'Akses Mikrofon Bermasalah';
+      }
+      setPeerMicError(msg);
+      setPeerMicStatus('error');
+      showToast(msg);
+      return false;
+    }
+
+    localStreamRef.current = stream;
+
+    const tvPeerId = getTvPeerId(roomId);
+    if (!peerRef.current) return false;
+
+    const mediaConn = peerRef.current.call(tvPeerId, stream, {
+      metadata: { singerName, senderId: peerRef.current.id },
+    });
+    mediaConnRef.current = mediaConn;
+
+    mediaConn.on('close', () => {
+      setPeerMicStreaming(false);
+      setPeerMicStatus('idle');
+    });
+
+    mediaConn.on('error', (err) => {
+      console.warn('[Mic] MediaConnection error:', err);
+      setPeerMicError('Koneksi streaming suara ke TV terputus.');
+      setPeerMicStatus('error');
+    });
+
+    setPeerMicStreaming(true);
+    setPeerMicStatus('connected');
+    showToast('🎤 Mikrofon HP Terhubung Langsung ke Speaker TV!');
+
+    // Setup local audio analyser for real-time VU meter
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioCtx) {
+        const audioCtx = new AudioCtx();
+        audioContextRef.current = audioCtx;
+        const source = audioCtx.createMediaStreamSource(stream);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 64;
+        source.connect(analyser);
+        analyserRef.current = analyser;
+
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        const updateVU = () => {
+          if (analyserRef.current && localStreamRef.current) {
+            analyserRef.current.getByteFrequencyData(dataArray);
+            let sum = 0;
+            for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+            const avg = sum / dataArray.length;
+            const lvl = Math.min(100, Math.round((avg / 128) * 100));
+            setPeerAudioLevel(lvl);
+            animFrameRef.current = requestAnimationFrame(updateVU);
+          }
+        };
+        updateVU();
+      }
+    } catch {}
+
+    return true;
+  }, [peerConnectionState, roomId, singerName, showToast]);
+
+  const stopPeerMic = useCallback(() => {
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
+    if (mediaConnRef.current) {
+      try {
+        mediaConnRef.current.close();
+      } catch {}
+      mediaConnRef.current = null;
+    }
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+    }
+    if (audioContextRef.current) {
+      try {
+        audioContextRef.current.close();
+      } catch {}
+      audioContextRef.current = null;
+    }
+    setPeerMicStreaming(false);
+    setPeerMicStatus('idle');
+    setPeerAudioLevel(0);
+    showToast('Mikrofon dimatikan');
+  }, [showToast]);
+
+  const togglePeerMicMute = useCallback(() => {
+    if (!localStreamRef.current) return;
+    const track = localStreamRef.current.getAudioTracks()[0];
+    if (track) {
+      track.enabled = !track.enabled;
+      const muted = !track.enabled;
+      setPeerMicMuted(muted);
+      showToast(muted ? 'Mikrofon dibisukan' : 'Mikrofon diaktifkan');
+    }
+  }, [showToast]);
 
   // Connect WebSocket & fallback SSE
   useEffect(() => {
@@ -458,7 +751,9 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
       setIsPlaying(true);
     }
 
-    // 2. Dual Send: WebSocket + HTTP POST
+    // 2. Multi-Channel Dispatch: PeerJS DataConnection (P2P Vercel) + WebSocket + HTTP POST
+    sendPeerAction('ADD_QUEUE', { song, singerName, priority });
+
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       try {
         wsRef.current.send(
@@ -496,6 +791,9 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
     setCurrentSong(song);
     setIsPlaying(true);
 
+    // Multi-Channel Dispatch
+    sendPeerAction('SELECT_SONG', song);
+
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       try {
         wsRef.current.send(
@@ -528,6 +826,9 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
       setQueue((prev) => prev.slice(1));
     }
 
+    // Multi-Channel Dispatch
+    sendPeerAction('NEXT_SONG');
+
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       try {
         wsRef.current.send(
@@ -555,6 +856,9 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
   const handleTogglePlayPause = async () => {
     const nextState = !isPlaying;
     setIsPlaying(nextState);
+
+    // Multi-Channel Dispatch: { action: "PLAY" } / { action: "PAUSE" }
+    sendPeerAction(nextState ? 'PLAY' : 'PAUSE');
 
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       try {
@@ -588,6 +892,8 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
     newQueue.splice(toIndex, 0, moved);
     setQueue(newQueue);
 
+    sendPeerAction('REORDER_QUEUE', { fromIndex, toIndex });
+
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(
         JSON.stringify({
@@ -611,6 +917,8 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
   // Remove song from queue
   const handleRemoveQueueItem = async (queueId: string) => {
     setQueue((prev) => prev.filter((q) => q.queueId !== queueId));
+
+    sendPeerAction('REMOVE_QUEUE', { queueId });
 
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(
@@ -639,6 +947,8 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
         navigator.vibrate(sound === 'boo' ? [120, 60, 180] : [60]);
       } catch {}
     }
+
+    sendPeerAction('PLAY_SOUND_FX', { sound, senderName: singerName });
 
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(
@@ -727,13 +1037,32 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
                   KARAOKE <span className="text-sky-400">DISKOMLEKAU</span>
                 </span>
               </div>
-              <div className="flex items-center gap-1.5 text-[11px] text-emerald-400 font-mono font-semibold">
+              <div className="flex items-center gap-1.5 text-[11px] font-mono font-semibold">
                 <span
                   className={`h-2 w-2 rounded-full ${
-                    isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
+                    peerConnectionState === 'connected'
+                      ? 'bg-emerald-400 animate-pulse'
+                      : peerConnectionState === 'connecting'
+                      ? 'bg-amber-400 animate-pulse'
+                      : 'bg-rose-500'
                   }`}
                 />
-                <span>Terhubung TV: {roomId}</span>
+                <span
+                  className={
+                    peerConnectionState === 'connected'
+                      ? 'text-emerald-400'
+                      : peerConnectionState === 'connecting'
+                      ? 'text-amber-300'
+                      : 'text-rose-400'
+                  }
+                >
+                  {peerConnectionState === 'connected'
+                    ? 'Terhubung ke TV'
+                    : peerConnectionState === 'connecting'
+                    ? 'Menghubungkan...'
+                    : 'Koneksi Terputus'}
+                </span>
+                <span className="text-slate-400 text-[10px]">({roomId})</span>
               </div>
             </div>
           </div>
@@ -1116,37 +1445,37 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
               {/* Status Badges */}
               <div className="mt-3 pt-3 border-t border-emerald-700/40 space-y-2 text-xs">
                 <div className="flex items-center justify-between">
-                  <span className="text-slate-300">Koneksi Ruangan:</span>
+                  <span className="text-slate-300">Koneksi TV (P2P):</span>
                   <div className="flex items-center gap-2">
                     <span className="font-mono font-bold flex items-center gap-1.5">
                       <span
                         className={`h-2 w-2 rounded-full ${
-                          wsReadyState === WebSocket.OPEN
+                          peerConnectionState === 'connected'
                             ? 'bg-emerald-400'
-                            : wsReadyState === WebSocket.CONNECTING
+                            : peerConnectionState === 'connecting'
                             ? 'bg-amber-400 animate-pulse'
                             : 'bg-rose-500'
                         }`}
                       />
                       <span
                         className={
-                          wsReadyState === WebSocket.OPEN
+                          peerConnectionState === 'connected'
                             ? 'text-emerald-300'
-                            : wsReadyState === WebSocket.CONNECTING
+                            : peerConnectionState === 'connecting'
                             ? 'text-amber-300'
                             : 'text-rose-300'
                         }
                       >
-                        {wsReadyState === WebSocket.OPEN
-                          ? `Terhubung (${roomId})`
-                          : wsReadyState === WebSocket.CONNECTING
-                          ? 'Menyambungkan...'
-                          : 'Terputus'}
+                        {peerConnectionState === 'connected'
+                          ? `Terhubung ke TV (${roomId})`
+                          : peerConnectionState === 'connecting'
+                          ? 'Menghubungkan...'
+                          : 'Koneksi Terputus'}
                       </span>
                     </span>
-                    {wsReadyState !== WebSocket.OPEN && (
+                    {peerConnectionState !== 'connected' && (
                       <button
-                        onClick={handleRequestReconnect}
+                        onClick={connectToTvPeer}
                         className="px-2 py-0.5 rounded bg-sky-600/80 hover:bg-sky-500 text-white text-[10px] font-bold transition active:scale-95 flex items-center gap-1"
                       >
                         <RefreshCw className="h-2.5 w-2.5" />
@@ -1161,31 +1490,31 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
                   <span className="font-mono font-bold flex items-center gap-1.5">
                     <span
                       className={`h-2 w-2 rounded-full ${
-                        isMicStreaming
+                        peerMicStreaming || isMicStreaming
                           ? 'bg-emerald-400 animate-ping'
-                          : micConnectionStatus === 'connecting'
+                          : peerMicStatus === 'connecting'
                           ? 'bg-amber-400 animate-pulse'
-                          : micConnectionStatus === 'error'
+                          : peerMicStatus === 'error'
                           ? 'bg-rose-400'
                           : 'bg-slate-400'
                       }`}
                     />
                     <span
                       className={
-                        isMicStreaming
+                        peerMicStreaming || isMicStreaming
                           ? 'text-emerald-300'
-                          : micConnectionStatus === 'connecting'
+                          : peerMicStatus === 'connecting'
                           ? 'text-amber-300'
-                          : micConnectionStatus === 'error'
+                          : peerMicStatus === 'error'
                           ? 'text-rose-300'
                           : 'text-slate-400'
                       }
                     >
-                      {isMicStreaming
-                        ? 'Mengudara ke TV (WebRTC)'
-                        : micConnectionStatus === 'connecting'
+                      {peerMicStreaming || isMicStreaming
+                        ? 'Mengudara ke TV (WebRTC P2P)'
+                        : peerMicStatus === 'connecting'
                         ? 'Menghubungkan WebRTC...'
-                        : micConnectionStatus === 'error'
+                        : peerMicStatus === 'error'
                         ? 'Perlu Izin / Tindakan'
                         : 'Siap Digunakan'}
                     </span>
@@ -1195,32 +1524,32 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
             </div>
 
             {/* Error banner if any */}
-            {micError && (
+            {(peerMicError || micError) && (
               <div className="rounded-xl border border-rose-500/60 bg-rose-950/85 p-3.5 text-xs text-rose-200 shadow-lg flex items-start gap-3">
                 <MicOff className="h-5 w-5 text-rose-400 shrink-0 mt-0.5" />
                 <div className="flex-1 space-y-1">
                   <p className="font-bold text-rose-300 text-sm">
-                    {micError.includes('WebSocket')
-                      ? 'Koneksi Ruangan Belum Siap'
-                      : micError.includes('Izin') || micError.includes('ditolak')
+                    {(peerMicError || micError || '').includes('belum siap')
+                      ? 'Koneksi ke TV Belum Siap'
+                      : (peerMicError || micError || '').includes('Izin') || (peerMicError || micError || '').includes('ditolak')
                       ? 'Izin Mikrofon Ditolak'
-                      : micError.includes('HTTPS')
+                      : (peerMicError || micError || '').includes('HTTPS')
                       ? 'Koneksi Wajib HTTPS'
                       : 'Akses Mikrofon Bermasalah'}
                   </p>
-                  <p className="text-[11px] leading-relaxed text-rose-100">{micError}</p>
-                  {micError.includes('WebSocket') && (
+                  <p className="text-[11px] leading-relaxed text-rose-100">{peerMicError || micError}</p>
+                  {peerConnectionState !== 'connected' && (
                     <button
-                      onClick={handleRequestReconnect}
+                      onClick={connectToTvPeer}
                       className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs shadow transition active:scale-95"
                     >
                       <RefreshCw className="h-3.5 w-3.5" />
-                      Sambungkan Ulang Ruangan Sekarang
+                      Sambungkan Ulang ke TV Sekarang
                     </button>
                   )}
-                  {micError.includes('Izin') && (
+                  {((peerMicError || micError || '').includes('Izin') || (peerMicError || micError || '').includes('ditolak')) && (
                     <p className="mt-1 text-[10px] text-amber-300">
-                      💡 Tips: Buka setelan browser HP (ikon gembok di samping tautan URL) &gt; Setelan Situs &gt; Izinkan Mikrofon, lalu muat ulang halaman.
+                      💡 Tips: Buka setelan browser HP (ikon gembok di samping alamat URL) &gt; Setelan Situs &gt; Izinkan Mikrofon, lalu coba lagi.
                     </p>
                   )}
                 </div>
@@ -1229,29 +1558,29 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
 
             {/* Main Interactive Mic Broadcast Console */}
             <div className="rounded-2xl border border-sky-800/70 bg-[#061430] p-5 shadow-2xl text-center space-y-4">
-              {!isMicStreaming ? (
+              {!(peerMicStreaming || isMicStreaming) ? (
                 <div className="space-y-4">
                   <button
                     onClick={async () => {
-                      if (wsReadyState !== WebSocket.OPEN) {
-                        showToast('Menyambungkan sinyal ruangan Karaoke...');
-                        handleRequestReconnect();
+                      if (peerConnectionState !== 'connected') {
+                        showToast('Menghubungkan ke TV Master (P2P)...');
+                        connectToTvPeer();
                       }
-                      await startMicBroadcast();
+                      await startPeerMic();
                     }}
-                    disabled={micConnectionStatus === 'connecting'}
-                    className="w-full py-4 px-6 rounded-2xl bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-600 hover:from-emerald-500 hover:to-teal-500 text-white font-display text-sm font-black tracking-wide shadow-xl shadow-emerald-950/70 border-2 border-emerald-400 active:scale-98 transition flex items-center justify-center gap-3 disabled:opacity-50"
+                    disabled={peerMicStatus === 'connecting'}
+                    className="w-full py-4 px-6 rounded-2xl bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-600 hover:from-emerald-500 hover:to-teal-500 text-white font-display text-sm font-black tracking-wide shadow-xl shadow-emerald-950/70 border-2 border-emerald-400 active:scale-98 transition flex items-center justify-center gap-3 disabled:opacity-50 cursor-pointer"
                   >
                     <Mic className="h-6 w-6 animate-bounce" />
                     <span>
-                      {micConnectionStatus === 'connecting'
+                      {peerMicStatus === 'connecting'
                         ? 'MENGHUBUNGKAN KE TV...'
                         : '🎤 NYALAKAN MIKROFON WIRELESS HP'}
                     </span>
                   </button>
 
                   <p className="text-xs text-slate-300 max-w-xs mx-auto leading-relaxed">
-                    Sentuh tombol di atas untuk bernyanyi! Suara mikrofon HP Anda akan dipancarkan secara instan ke TV melalui jalur audio WebRTC P2P.
+                    Sentuh tombol di atas untuk bernyanyi! Suara mikrofon HP Anda akan dipancarkan secara instan ke TV melalui jalur audio WebRTC P2P (0.peerjs.com).
                   </p>
                 </div>
               ) : (
@@ -1264,7 +1593,7 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
                         INDIKATOR LEVEL SUARA (VU METER)
                       </span>
                       <span className="font-mono text-xs font-black text-white bg-black/60 px-2 py-0.5 rounded border border-emerald-600/50">
-                        {micAudioLevel}%
+                        {peerAudioLevel || micAudioLevel}%
                       </span>
                     </div>
 
@@ -1272,7 +1601,7 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
                     <div className="h-4 w-full bg-slate-900 rounded-lg overflow-hidden p-0.5 border border-slate-700 flex gap-0.5">
                       {Array.from({ length: 20 }).map((_, idx) => {
                         const threshold = (idx + 1) * 5;
-                        const isLit = micAudioLevel >= threshold;
+                        const isLit = (peerAudioLevel || micAudioLevel) >= threshold;
                         const isRed = idx >= 16;
                         const isYellow = idx >= 12 && idx < 16;
 
@@ -1282,10 +1611,10 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
                             className={`flex-1 rounded-sm transition-all duration-75 ${
                               isLit
                                 ? isRed
-                                  ? 'bg-rose-500 shadow-sm shadow-rose-500/50'
-                                  : isYellow
-                                  ? 'bg-amber-400 shadow-sm shadow-amber-400/50'
-                                  : 'bg-emerald-400 shadow-sm shadow-emerald-400/50'
+                                ? 'bg-rose-500 shadow-sm shadow-rose-500/50'
+                                : isYellow
+                                ? 'bg-amber-400 shadow-sm shadow-amber-400/50'
+                                : 'bg-emerald-400 shadow-sm shadow-emerald-400/50'
                                 : 'bg-slate-800/80'
                             }`}
                           />
@@ -1304,14 +1633,14 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
                   {/* Dual Action Controls: Mute & Stop */}
                   <div className="grid grid-cols-2 gap-2.5">
                     <button
-                      onClick={toggleMicMute}
-                      className={`py-3 px-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 border transition active:scale-95 shadow ${
-                        isMicMuted
+                      onClick={togglePeerMicMute}
+                      className={`py-3 px-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 border transition active:scale-95 shadow cursor-pointer ${
+                        peerMicMuted || isMicMuted
                           ? 'bg-rose-600 hover:bg-rose-500 text-white border-rose-300'
                           : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-600'
                       }`}
                     >
-                      {isMicMuted ? (
+                      {peerMicMuted || isMicMuted ? (
                         <>
                           <MicOff className="h-4 w-4 text-amber-300" />
                           <span>Buka Suara Mic</span>
@@ -1325,8 +1654,8 @@ export const MobileClientView: React.FC<MobileClientViewProps> = ({
                     </button>
 
                     <button
-                      onClick={() => stopMicBroadcast()}
-                      className="py-3 px-3 rounded-xl bg-rose-700 hover:bg-rose-600 text-white font-bold text-xs flex items-center justify-center gap-2 border border-rose-400 active:scale-95 shadow"
+                      onClick={stopPeerMic}
+                      className="py-3 px-3 rounded-xl bg-rose-700 hover:bg-rose-600 text-white font-bold text-xs flex items-center justify-center gap-2 border border-rose-400 active:scale-95 shadow cursor-pointer"
                     >
                       <X className="h-4 w-4" />
                       <span>Matikan Mic</span>

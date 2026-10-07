@@ -777,6 +777,7 @@ export function useWebRTCAudioReceiver({ socketRef, roomId }: UseWebRTCAudioRece
     toggleClientMicMute,
     broadcastMicParams,
     handleSignalingMessage,
+    attachAudioStream,
     cleanupSender,
   };
 }
